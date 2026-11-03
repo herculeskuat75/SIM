@@ -1,0 +1,117 @@
+name: Build APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # Mencari project Android otomatis:
+      # 1) kalau file project sudah ada langsung di repo -> dipakai
+      # 2) kalau berupa .zip (termasuk zip di dalam zip) -> diekstrak otomatis
+      - name: Siapkan project
+        shell: bash
+        run: |
+          set -e
+          SRC="$GITHUB_WORKSPACE/_src"
+          mkdir -p "$SRC"
+
+          find_root() {
+            find "$1" -maxdepth 6 \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path '*/.git/*' -not -path '*/_src/*' -not -path '*/__MACOSX/*' \
+              -not -path '*/build/*' -printf '%d %h\n' 2>/dev/null | sort -n | head -n1 | cut -d' ' -f2-
+          }
+
+          ROOT=$(find_root "$GITHUB_WORKSPACE")
+          if [ -z "$ROOT" ]; then
+            ROOT=$(find "$SRC" -maxdepth 6 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' -printf '%d %h\n' | sort -n | head -n1 | cut -d' ' -f2-)
+          fi
+
+          if [ -z "$ROOT" ]; then
+            # ekstrak semua zip di repo (maks 2 tingkat folder)
+            i=0
+            while IFS= read -r z; do
+              i=$((i+1))
+              echo "Ekstrak: $z"
+              unzip -o -q "$z" -d "$SRC/z$i" || true
+            done < <(find "$GITHUB_WORKSPACE" -maxdepth 2 -iname '*.zip' -not -path '*/.git/*' -not -path '*/_src/*')
+
+            # zip di dalam zip (maks 3 putaran)
+            for round in 1 2 3; do
+              ROOT=$(find "$SRC" -maxdepth 6 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' -printf '%d %h\n' | sort -n | head -n1 | cut -d' ' -f2-)
+              [ -n "$ROOT" ] && break
+              found=0
+              while IFS= read -r z; do
+                [ -d "$z.x" ] && continue
+                found=1
+                echo "Ekstrak zip dalam: $z"
+                unzip -o -q "$z" -d "$z.x" || true
+              done < <(find "$SRC" -maxdepth 6 -iname '*.zip')
+              [ "$found" = 0 ] && break
+            done
+          fi
+
+          if [ -z "$ROOT" ]; then
+            echo "::error::settings.gradle(.kts) tidak ditemukan. Isi repo/zip:"
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -not -path '*/.git/*' | head -80
+            exit 1
+          fi
+
+          echo "Project root: $ROOT"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+
+      # Memakai Gradle 8.7 dari setup-gradle, jadi tidak butuh gradle-wrapper.jar
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Cari APK dan tentukan nama/tag
+        id: ver
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(find . -path '*/build/outputs/apk/debug/*.apk' | head -n1)
+          [ -n "$APK" ] || { echo "::error::APK tidak ditemukan"; exit 1; }
+
+          # nama app: dari rootProject.name di settings.gradle(.kts), cadangan: nama repo
+          NAME=$(grep -hoE "rootProject\.name *= *[\"'][^\"']+[\"']" settings.gradle* 2>/dev/null | head -n1 | sed -E "s/.*[\"']([^\"']+)[\"'].*/\1/")
+          NAME=${NAME:-${GITHUB_REPOSITORY##*/}}
+          NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '_')
+
+          VN=$(grep -rhoE 'versionName *= *"[^"]+"' --include=build.gradle.kts --include=build.gradle . | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          VN=${VN:-0}
+
+          OUT="${NAME}-v${VN}-${{ github.run_number }}.apk"
+          cp "$APK" "$GITHUB_WORKSPACE/$OUT"
+          echo "apk=$OUT" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VN}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.name }}-apk
+          path: ${{ steps.ver.outputs.apk }}
+
+      - name: Buat GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.name }} ${{ steps.ver.outputs.tag }}
+          files: ${{ steps.ver.outputs.apk }}
